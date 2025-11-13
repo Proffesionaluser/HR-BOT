@@ -1,14 +1,13 @@
-# 5bot.py — HR-бот: ES/UA, Google Sheet (FAQ / Forms / Profiles)
+# 5bot.py — HR-бот: ES/UA, Google Sheet (FAQ / Forms / Profiles) + Email OTP
 import os, re, csv, html, json, asyncio, logging, urllib.parse, io, hashlib, unicodedata
+import time, secrets, smtplib
+from email.message import EmailMessage
 from io import StringIO, BytesIO
 from pathlib import Path
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional
 
 import aiosqlite
 import httpx
-import smtplib, ssl, secrets
-from datetime import datetime, timedelta, timezone
-
 from dotenv import load_dotenv
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo, InputFile
@@ -35,22 +34,23 @@ WEBAPP_URL = os.getenv("WEBAPP_URL") or ""
 SYNC_INTERVAL_MIN = int(os.getenv("SYNC_INTERVAL_MIN") or "0")  # 0 = off
 
 GOOGLE_SHEET_EDIT_URL = os.getenv("GOOGLE_SHEET_EDIT_URL") or ""
-GOOGLE_FAQ_GID = os.getenv("GOOGLE_FAQ_GID") or ""
+# Поддерживаем и старое имя переменной:
+GOOGLE_FAQ_GID = os.getenv("GOOGLE_FAQ_GID") or os.getenv("GOOGLE_MAIN_GID") or ""
 GOOGLE_FORMS_GID = os.getenv("GOOGLE_FORMS_GID") or ""
 GOOGLE_PROFILES_GID = os.getenv("GOOGLE_PROFILES_GID") or ""
 
-# SMTP/OTP
-SMTP_HOST = os.getenv("SMTP_HOST", "")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER = os.getenv("SMTP_USER", "")
-SMTP_PASS = os.getenv("SMTP_PASS", "")
-SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER or "no-reply@example.com")
-SMTP_USE_SSL = os.getenv("SMTP_USE_SSL", "false").lower() in {"1","true","yes"}
+# SMTP / OTP
+SMTP_HOST = os.getenv("SMTP_HOST") or ""
+SMTP_PORT = int(os.getenv("SMTP_PORT") or ("465" if (os.getenv("SMTP_USE_SSL","true").lower()=="true") else "587"))
+SMTP_USER = os.getenv("SMTP_USER") or ""
+SMTP_PASS = (os.getenv("SMTP_PASS") or "").strip()
+SMTP_FROM = os.getenv("SMTP_FROM") or (f"HR Assistant <{SMTP_USER}>" if SMTP_USER else "HR Assistant <no-reply@example.com>")
+SMTP_USE_SSL = (os.getenv("SMTP_USE_SSL","true").lower() == "true")
 
-OTP_TTL_MIN = int(os.getenv("OTP_TTL_MIN", "10"))
-OTP_ATTEMPTS_MAX = int(os.getenv("OTP_ATTEMPTS_MAX", "5"))
-OTP_RESEND_MAX = int(os.getenv("OTP_RESEND_MAX", "3"))
-OTP_PEPPER = os.getenv("OTP_PEPPER", "change-me")
+OTP_TTL_MIN      = int(os.getenv("OTP_TTL_MIN") or "10")
+OTP_ATTEMPTS_MAX = int(os.getenv("OTP_ATTEMPTS_MAX") or "5")
+OTP_RESEND_MAX   = int(os.getenv("OTP_RESEND_MAX") or "3")
+OTP_PEPPER       = os.getenv("OTP_PEPPER") or "change-this-string"
 
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
@@ -58,6 +58,7 @@ DB_PATH = DATA_DIR / "hr_forms.db"
 
 LANGS = ("es", "uk")
 
+# ---------- утилиты рендеринга ----------
 def to_html(text: str) -> str:
     esc = html.escape(text or "")
     return re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", esc)
@@ -87,15 +88,15 @@ TX: Dict[str, Dict[str, str]] = {
                "/help — ayuda\n"
                "/cancel — cancelar formulario\n"
                "/myid — tu Telegram ID\n"
-               "/whoami — ver tu perfil\n"
-               "/logout — desvincular login\n"
-               "/verify — verificación\n"
-               "/resend — reenviar código de verificación\n"
                "/stats — estadísticas (admin)\n"
                "/users [offset] [limit] — lista (admin)\n"
                "/export_users — exportar CSV (admin)\n"
                "/setprofile <login> <json> — guardar perfil (admin)\n"
                "/import_profiles — importar CSV de perfiles (admin)\n"
+               "/whoami — ver tu perfil\n"
+               "/logout — desvincular login\n"
+               "/verify — verificación\n"
+               "/resend — reenviar código\n"
                "/refresh — recargar Google Sheet (admin)\n"
                "/dump_profile <login> — ver perfil crudo (admin)\n"),
         "uk": ("Команди:\n"
@@ -103,15 +104,15 @@ TX: Dict[str, Dict[str, str]] = {
                "/help — допомога\n"
                "/cancel — скасувати форму\n"
                "/myid — ваш Telegram ID\n"
-               "/whoami — показати профіль\n"
-               "/logout — відʼєднати логін\n"
-               "/verify — верифікація\n"
-               "/resend — надіслати код повторно\n"
                "/stats — статистика (адмін)\n"
                "/users [offset] [limit] — список (адмін)\n"
                "/export_users — експорт CSV (адмін)\n"
                "/setprofile <login> <json> — зберегти профіль (адмін)\n"
                "/import_profiles — імпорт CSV профілів (адмін)\n"
+               "/whoami — показати профіль\n"
+               "/logout — відʼєднати логін\n"
+               "/verify — верифікація\n"
+               "/resend — надіслати код знову\n"
                "/refresh — перезавантажити Google Sheet (адмін)\n"
                "/dump_profile <login> — подивитись сирий профіль (адмін)\n")
     },
@@ -128,7 +129,7 @@ TX: Dict[str, Dict[str, str]] = {
     }
 }
 
-# ---------- нормализация текста ----------
+# ---------- нормализация текста из таблицы ----------
 NL_SPLIT = re.compile(r"[;\|\n,]")
 
 def _clean_text(s: str) -> str:
@@ -264,10 +265,11 @@ async def fetch_sheet_configs():
                 "extra_json": None,
             }
 
-    for r in rows_faq:     ingest_row(r)
-    for r in rows_forms:   ingest_row(r)
-    for r in rows_profiles:ingest_row(r)
+    for r in rows_faq:       ingest_row(r)
+    for r in rows_forms:     ingest_row(r)
+    for r in rows_profiles:  ingest_row(r)
 
+    # дефолты на случай пустых таблиц
     if not FORMS_es_new and not FORMS_uk_new:
         FORMS_es_new.update({"vacation": {"name":"Solicitud de vacaciones","fields":["Nombre","Posición","Inicio","Fin","Días"],"icon":"📅","url":None}})
         FORMS_uk_new.update({"vacation": {"name":"Заява на відпустку","fields":["ПІБ","Посада","Початок","Завершення","Кількість днів"],"icon":"📅","url":None}})
@@ -311,13 +313,17 @@ def profile_card(lang: str, p: dict) -> str:
 # ---------- безопасные callback токены для FAQ ----------
 CB_MAP = {"es": {}, "uk": {}}
 
-# ---------- клавиатуры ----------
+# ---------- навигация: клавиатуры ----------
 def lang_toggle_row(lang: str) -> List[InlineKeyboardButton]:
     return [InlineKeyboardButton("🇺🇦 UA", callback_data="lang_uk")] if lang == "es" else [InlineKeyboardButton("🇪🇸 ES", callback_data="lang_es")]
 
-def kb_back(lang: str, target_cb: str) -> InlineKeyboardMarkup:
+def kb_back_to(target: str, lang: str) -> InlineKeyboardMarkup:
+    # target ∈ {"main","menu_quick","menu_forms"}
+    title = {"main": ("⬅️ Atrás" if lang=="es" else "⬅️ Назад"),
+             "menu_quick": ("⬅️ Atrás" if lang=="es" else "⬅️ Назад"),
+             "menu_forms": ("⬅️ Atrás" if lang=="es" else "⬅️ Назад")}[target]
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⬅️ Atrás" if lang == "es" else "⬅️ Назад", callback_data=target_cb)],
+        [InlineKeyboardButton(title, callback_data=f"back_to:{target}")],
         lang_toggle_row(lang)
     ])
 
@@ -354,10 +360,8 @@ def kb_forms_info(lang: str) -> InlineKeyboardMarkup:
     items = sorted(forms.items(), key=lambda kv: kv[1].get("name",""))
     rows = []
     for key, meta in items:
-        rows.append([
-            InlineKeyboardButton(f"{meta.get('icon','📝')} {meta['name']}", callback_data=f"formchoice_{key}")
-        ])
-    rows.append([InlineKeyboardButton("⬅️ Atrás" if lang=="es" else "⬅️ Назад", callback_data="back_main")])
+        rows.append([InlineKeyboardButton(f"{meta.get('icon','📝')} {meta['name']}", callback_data=f"formchoice_{key}")])
+    rows.append([InlineKeyboardButton("⬅️ Atrás" if lang=="es" else "⬅️ Назад", callback_data="back_to:main")])
     rows.append(lang_toggle_row(lang))
     return InlineKeyboardMarkup(rows)
 
@@ -368,13 +372,13 @@ def kb_form_choice(lang: str, form_key: str) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton("✍️ Rellenar en el bot" if lang=="es" else "✍️ Заповнити в боті", callback_data=f"formfill_{form_key}")])
     if f.get("url"):
         rows.append([InlineKeyboardButton("🌐 Abrir Google Form" if lang=="es" else "🌐 Відкрити Google Form", url=f["url"])])
-    rows.append([InlineKeyboardButton("⬅️ Atrás" if lang=="es" else "⬅️ Назад", callback_data="menu_forms")])
+    rows.append([InlineKeyboardButton("⬅️ Atrás" if lang=="es" else "⬅️ Назад", callback_data="back_to:menu_forms")])
     rows.append(lang_toggle_row(lang))
     return InlineKeyboardMarkup(rows)
 
 def kb_quick(lang: str) -> InlineKeyboardMarkup:
     KB = kb_for_lang(lang)
-    items: List[Tuple[str, str]] = []
+    items: List[tuple[str, str]] = []
     for k, v in KB.items():
         t = (v.get("title") or k).strip()
         r = (v.get("response") or "").strip()
@@ -394,11 +398,11 @@ def kb_quick(lang: str) -> InlineKeyboardMarkup:
             rows.append(row); row = []
     if row: rows.append(row)
 
-    rows.append([InlineKeyboardButton("⬅️ Назад" if lang=="uk" else "⬅️ Atrás", callback_data="back_main")])
+    rows.append([InlineKeyboardButton("⬅️ Atrás" if lang=="es" else "⬅️ Назад", callback_data="back_to:main")])
     rows.append(lang_toggle_row(lang))
     return InlineKeyboardMarkup(rows)
 
-# ---------- текстовые блоки по формам ----------
+# ---------- текст для выбора способа заполнения ----------
 def _form_choice_text(lang: str, key: str) -> str:
     forms = forms_for_lang(lang)
     f = forms.get(key)
@@ -439,6 +443,10 @@ def _form_info_text(lang: str, key: str) -> str:
     return f"{title}\n{lines}\n\n{hint}{url_section}"
 
 # ---------- сервиски ----------
+async def ack(query, text: str | None = None):
+    try: await query.answer(text=text, show_alert=False, cache_time=0)
+    except: pass
+
 async def show_loader_and_edit(query, final_text: str, reply_markup=None, parse_mode="HTML", delay_ms=200, lang="es"):
     try: await query.edit_message_text("⏳ <i>Cargando…</i>" if lang=="es" else "⏳ <i>Завантаження…</i>", parse_mode="HTML")
     except: pass
@@ -484,39 +492,24 @@ CREATE TABLE IF NOT EXISTS users (
     click_count INTEGER DEFAULT 0
 );
 """
-CREATE_PROFILES_SQL = """
-CREATE TABLE IF NOT EXISTS profiles (
-    login TEXT PRIMARY KEY,
-    full_name TEXT,
-    position TEXT,
-    team TEXT,
-    email TEXT,
-    phone TEXT,
-    manager TEXT,
-    vacation_left INTEGER,
-    salary_usd INTEGER,
-    extra_json TEXT
-);
-"""
-CREATE_VERIFY_SQL = """
-CREATE TABLE IF NOT EXISTS verify_codes (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    tg_user_id INTEGER,
-    email TEXT,
-    code_hash TEXT,
-    sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    expires_at TIMESTAMP,
-    attempts INTEGER DEFAULT 0,
-    resend_count INTEGER DEFAULT 0
-);
-"""
-
 async def init_db():
     async with aiosqlite.connect(DB_PATH.as_posix()) as db:
         await db.execute(CREATE_FORMS_SQL)
         await db.execute(CREATE_USERS_SQL)
-        await db.execute(CREATE_PROFILES_SQL)
-        await db.execute(CREATE_VERIFY_SQL)
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS profiles (
+            login TEXT PRIMARY KEY,
+            full_name TEXT,
+            position TEXT,
+            team TEXT,
+            email TEXT,
+            phone TEXT,
+            manager TEXT,
+            vacation_left INTEGER,
+            salary_usd INTEGER,
+            extra_json TEXT
+        );
+        """)
         cur = await db.execute("PRAGMA table_info(users)")
         cols = {row[1] for row in await cur.fetchall()}
         if "pref_lang" not in cols:   await db.execute("ALTER TABLE users ADD COLUMN pref_lang TEXT DEFAULT 'es'")
@@ -623,124 +616,6 @@ async def upsert_profiles(profiles: Dict[str, dict]):
             ))
         await db.commit()
 
-# ---------- OTP/Email утилиты ----------
-def _mask_email(s: str) -> str:
-    s = (s or "").strip()
-    if "@" not in s:
-        return s
-    name, dom = s.split("@", 1)
-    name_m = (name[0] + "*"*(len(name)-1)) if len(name) > 1 else name
-    dom_parts = dom.split(".")
-    dom_m = ".".join([p[0] + "*"*(len(p)-1) if p else p for p in dom_parts])
-    return f"{name_m}@{dom_m}"
-
-def _otp_hash(code: str) -> str:
-    return hashlib.sha256((OTP_PEPPER + str(code)).encode("utf-8")).hexdigest()
-
-def _now_utc():
-    return datetime.now(timezone.utc)
-
-async def _otp_purge_old():
-    async with aiosqlite.connect(DB_PATH.as_posix()) as db:
-        await db.execute("DELETE FROM verify_codes WHERE expires_at < ?", (_now_utc().isoformat(),))
-        await db.commit()
-
-async def _otp_create(user_id: int, email: str) -> str:
-    await _otp_purge_old()
-    code = f"{secrets.randbelow(1000000):06d}"
-    h = _otp_hash(code)
-    expires = (_now_utc() + timedelta(minutes=OTP_TTL_MIN)).isoformat()
-    async with aiosqlite.connect(DB_PATH.as_posix()) as db:
-        await db.execute("DELETE FROM verify_codes WHERE tg_user_id=?", (user_id,))
-        await db.execute("""
-            INSERT INTO verify_codes (tg_user_id, email, code_hash, expires_at, attempts, resend_count)
-            VALUES (?, ?, ?, ?, 0, 0)
-        """, (user_id, (email or "").strip().lower(), h, expires))
-        await db.commit()
-    return code
-
-async def _otp_inc_attempt(user_id: int) -> int:
-    async with aiosqlite.connect(DB_PATH.as_posix()) as db:
-        await db.execute("UPDATE verify_codes SET attempts = attempts + 1 WHERE tg_user_id=?", (user_id,))
-        await db.commit()
-        cur = await db.execute("SELECT attempts FROM verify_codes WHERE tg_user_id=?", (user_id,))
-        row = await cur.fetchone()
-    return int(row[0]) if row else OTP_ATTEMPTS_MAX
-
-async def _otp_can_resend(user_id: int) -> bool:
-    async with aiosqlite.connect(DB_PATH.as_posix()) as db:
-        cur = await db.execute("SELECT resend_count FROM verify_codes WHERE tg_user_id=?", (user_id,))
-        row = await cur.fetchone()
-    return (row is None) or (int(row[0]) < OTP_RESEND_MAX)
-
-async def _otp_mark_resend(user_id: int):
-    async with aiosqlite.connect(DB_PATH.as_posix()) as db:
-        await db.execute("UPDATE verify_codes SET resend_count = resend_count + 1 WHERE tg_user_id=?", (user_id,))
-        await db.commit()
-
-async def _otp_verify(user_id: int, code: str) -> Tuple[bool, str]:
-    await _otp_purge_old()
-    async with aiosqlite.connect(DB_PATH.as_posix()) as db:
-        cur = await db.execute("""
-            SELECT code_hash, expires_at, attempts FROM verify_codes
-            WHERE tg_user_id=?
-        """, (user_id,))
-        row = await cur.fetchone()
-    if not row:
-        return False, "no_active"
-    code_hash, expires_at, attempts = row
-    if datetime.fromisoformat(expires_at) < _now_utc():
-        return False, "expired"
-    if int(attempts) >= OTP_ATTEMPTS_MAX:
-        return False, "too_many"
-    if _otp_hash(code) == code_hash:
-        async with aiosqlite.connect(DB_PATH.as_posix()) as db:
-            await db.execute("DELETE FROM verify_codes WHERE tg_user_id=?", (user_id,))
-            await db.commit()
-        return True, "ok"
-    att = await _otp_inc_attempt(user_id)
-    if att >= OTP_ATTEMPTS_MAX:
-        return False, "too_many"
-    return False, "mismatch"
-
-def _send_email_sync(host, port, user, pwd, use_ssl, from_addr, to_addr, subject, body):
-    msg = f"From: {from_addr}\r\nTo: {to_addr}\r\nSubject: {subject}\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{body}"
-    if use_ssl:
-        context = ssl.create_default_context()
-        with smtplib.SMTP_SSL(host, port, context=context) as s:
-            if user:
-                s.login(user, pwd)
-            s.sendmail(from_addr, [to_addr], msg.encode("utf-8"))
-    else:
-        with smtplib.SMTP(host, port) as s:
-            s.ehlo()
-            s.starttls(context=ssl.create_default_context())
-            if user:
-                s.login(user, pwd)
-            s.sendmail(from_addr, [to_addr], msg.encode("utf-8"))
-
-async def _send_email_otp(to_email: str, code: str, lang: str):
-    if not SMTP_HOST:
-        raise RuntimeError("SMTP_HOST не задан — відправка коду неможлива")
-    subj = "Код підтвердження" if lang == "uk" else "Código de verificación"
-    body = (
-        f"Ваш код підтвердження: {code}\n"
-        f"Діє {OTP_TTL_MIN} хвилин.\n\n"
-        f"Якщо це не ви — проігноруйте лист."
-        if lang == "uk" else
-        f"Tu código de verificación: {code}\n"
-        f"Válido durante {OTP_TTL_MIN} minutos.\n\n"
-        f"Si no fuiste tú, ignora este correo."
-    )
-    await asyncio.to_thread(
-        _send_email_sync, SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_USE_SSL,
-        SMTP_FROM, to_email, subj, body
-    )
-
-async def _issue_and_send_otp(user_id: int, email: str, lang: str) -> None:
-    code = await _otp_create(user_id, email)
-    await _send_email_otp(email, code, lang)
-
 # ---------- верификация ----------
 def _digits_only(s: str) -> str:
     if not s:
@@ -770,13 +645,54 @@ def _phones_match(user_input: str, expected: str) -> bool:
         (len(ui) >= 9  and len(ex) >= 9  and _last_n(ui, 9)  == _last_n(ex, 9))
     )
     if not ok:
-        log.warning("[verify] phone mismatch | ui='%s' ex='%s'", ui, ex)
+        log.warning("[verify] phone mismatch | ui_raw='%s' ui=%s | ex_raw='%s' ex=%s | last10(%s,%s) | last9(%s,%s)",
+                    user_input, ui, expected, ex, _last_n(ui,10), _last_n(ex,10), _last_n(ui,9), _last_n(ex,9))
     else:
         log.info("[verify] phone matched")
     return ok
 
 def _norm_email(s: str) -> str:
     return (s or "").strip().lower()
+
+def _gen_otp_code(n=6) -> str:
+    return f"{secrets.randbelow(10**n):0{n}d}"
+
+def _otp_subject(lang: str) -> str:
+    return "Код підтвердження HR Assistant" if lang=="uk" else "HR Assistant verification code"
+
+def _otp_body(lang: str, code: str, ttl_min: int) -> str:
+    if lang == "uk":
+        return f"Ваш одноразовий код: {code}\nДіє {ttl_min} хвилин.\nЯкщо ви не запитували код, просто ігноруйте цей лист."
+    else:
+        return f"Your one-time code: {code}\nValid for {ttl_min} minutes.\nIf you didn’t request it, you can ignore this email."
+
+def _send_email_sync(to_email: str, subject: str, body: str) -> bool:
+    msg = EmailMessage()
+    msg["From"] = SMTP_FROM
+    msg["To"] = to_email
+    msg["Subject"] = subject
+    msg.set_content(body)
+
+    try:
+        if SMTP_USE_SSL:
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=20) as s:
+                if SMTP_USER:
+                    s.login(SMTP_USER, SMTP_PASS)
+                s.send_message(msg)
+        else:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as s:
+                s.ehlo()
+                s.starttls()
+                if SMTP_USER:
+                    s.login(SMTP_USER, SMTP_PASS)
+                s.send_message(msg)
+        return True
+    except Exception as e:
+        log.error(f"[email] send failed: {e}")
+        return False
+
+async def send_email(to_email: str, subject: str, body: str) -> bool:
+    return await asyncio.to_thread(_send_email_sync, to_email, subject, body)
 
 async def set_verified(user_id: int, value: int):
     async with aiosqlite.connect(DB_PATH.as_posix()) as db:
@@ -820,10 +736,14 @@ async def start_verification_flow(update_or_query, context: ContextTypes.DEFAULT
         return
 
     context.user_data["verify"] = {
-        "step": 1,  # 1: телефон; 3: код из email
+        "step": 1,
+        "lang": lang,
         "expect_phone": (prof.get("phone") or ""),
-        "email": _norm_email(prof.get("email")),
-        "lang": lang
+        "email": None,
+        "otp": None,
+        "otp_sent_ts": 0,
+        "attempts": 0,
+        "resends": 0
     }
 
     prompt = "📞 Вкажіть номер телефону (тільки цифри)." if lang=="uk" else "📞 Indica tu número (solo dígitos)."
@@ -879,25 +799,24 @@ async def cmd_verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start_verification_flow(update, context)
 
 async def cmd_resend(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    lang = await get_pref_lang(uid)
-    vf = context.user_data.get("verify")
-    if not vf or vf.get("step") != 3:
-        msg = "Немає активної перевірки коду." if lang=="uk" else "No hay verificación de código activa."
-        await update.message.reply_text(msg, reply_markup=await kb_main_for(uid))
+    vf = context.user_data.get("verify") or {}
+    lang = vf.get("lang") or await get_pref_lang(update.effective_user.id)
+    if not vf or int(vf.get("step") or 0) != 3 or not vf.get("email"):
+        await update.message.reply_text("Немає активного коду." if lang=="uk" else "No active code.")
         return
-    if not await _otp_can_resend(uid):
-        msg = "⛔ Ліміт повторних відправок вичерпано. Спробуйте пізніше." if lang=="uk" else "⛔ Límite de reenvíos alcanzado. Intenta más tarde."
-        await update.message.reply_text(msg)
+    if int(vf.get("resends") or 0) >= OTP_RESEND_MAX:
+        await update.message.reply_text("Ліміт повторів вичерпано." if lang=="uk" else "Resend limit reached.")
         return
-    try:
-        await _issue_and_send_otp(uid, vf.get("email") or "", lang)
-        await _otp_mark_resend(uid)
-        em_mask = _mask_email(vf.get("email") or "")
-        msg = ("✉️ Новий код відправлено на " if lang=="uk" else "✉️ Nuevo código enviado a ") + f"<b>{html.escape(em_mask)}</b>"
-        await update.message.reply_html(msg)
-    except Exception as e:
-        await update.message.reply_text(f"❌ {e}")
+
+    code = _gen_otp_code(6)
+    vf["otp"] = code
+    vf["otp_sent_ts"] = int(time.time())
+    vf["resends"] = int(vf.get("resends") or 0) + 1
+    sent = await send_email(vf["email"], _otp_subject(lang), _otp_body(lang, code, OTP_TTL_MIN))
+    if sent:
+        await update.message.reply_text("✅ Новий код надіслано. Перевірте пошту." if lang=="uk" else "✅ New code sent. Check your email.")
+    else:
+        await update.message.reply_text("❌ Не вдалося надіслати новий код." if lang=="uk" else "❌ Failed to resend code.")
 
 async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang = await get_pref_lang(update.effective_user.id)
@@ -924,10 +843,10 @@ async def _start_form_fill(update_or_query, context: ContextTypes.DEFAULT_TYPE, 
     if not fields:
         txt = _form_info_text(lang, key)
         if isinstance(update_or_query, Update) and update_or_query.message:
-            await update_or_query.message.reply_text(txt, parse_mode="HTML", reply_markup=kb_back(lang, f"formchoice_{key}"))
+            await update_or_query.message.reply_text(txt, parse_mode="HTML")
         else:
             q = update_or_query
-            await show_loader_and_edit(q, txt, reply_markup=kb_back(lang, f"formchoice_{key}"), parse_mode="HTML", lang=lang)
+            await show_loader_and_edit(q, txt, reply_markup=kb_back_to("menu_forms", lang), parse_mode="HTML", lang=lang)
         return
 
     context.user_data["form_fill"] = {"key": key, "fields": fields, "answers": [], "i": 0, "lang": lang}
@@ -965,6 +884,18 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await start_verification_flow(query, context); return
         await show_loader_and_edit(query, TX["menu_main"][lang], reply_markup=await kb_main_for(uid), lang=lang); return
 
+    # Обработка «Назад»
+    if data.startswith("back_to:"):
+        target = data.split(":",1)[1]
+        if target == "main":
+            await show_loader_and_edit(query, TX["menu_main"][lang], reply_markup=await kb_main_for(uid), lang=lang); return
+        elif target == "menu_quick":
+            await show_loader_and_edit(query, TX["menu_quick_title"][lang], kb_quick(lang), lang=lang); return
+        elif target == "menu_forms":
+            await show_loader_and_edit(query, TX["menu_forms_title"][lang], kb_forms_info(lang), lang=lang); return
+        else:
+            await show_loader_and_edit(query, TX["menu_main"][lang], reply_markup=await kb_main_for(uid), lang=lang); return
+
     # Верификация
     if data == "start_verify":
         await start_verification_flow(query, context); return
@@ -980,9 +911,6 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show_loader_and_edit(query, "🔒 Спершу пройдіть верифікацію: натисніть «Верифікація».", reply_markup=await kb_main_for(uid), lang=lang); return
         await show_loader_and_edit(query, TX["menu_forms_title"][lang], kb_forms_info(lang), lang=lang); return
 
-    if data == "back_main":
-        await show_loader_and_edit(query, TX["menu_main"][lang], reply_markup=await kb_main_for(uid), lang=lang); return
-
     # Профиль
     if data == "menu_profile":
         login = await get_user_login(uid)
@@ -991,18 +919,12 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         prof = await get_profile_by_login(login)
         if not prof:
             await show_loader_and_edit(query, "❌ Профіль не знайдено." if lang=="uk" else "❌ Perfil no encontrado.", reply_markup=await kb_main_for(uid), lang=lang); return
-        await show_loader_and_edit(query, profile_card(lang, prof), reply_markup=kb_back(lang, "back_main"), parse_mode="HTML", lang=lang); return
+        await show_loader_and_edit(query, profile_card(lang, prof), reply_markup=kb_back_to("main", lang), parse_mode="HTML", lang=lang); return
 
     # Меню выбора способа заполнения формы
     if data.startswith("formchoice_"):
         if not is_admin(uid) and not await is_verified(uid):
             await show_loader_and_edit(query, "🔒 Спершу пройдіть верифікацію.", reply_markup=await kb_main_for(uid), lang=lang); return
-        key = data.split("_", 1)[1]
-        text = _form_choice_text(lang, key)
-        await show_loader_and_edit(query, text, reply_markup=kb_form_choice(lang, key), parse_mode="HTML", lang=lang); return
-
-    # Ретрансляция старого префикса
-    if data.startswith("forminfo_"):
         key = data.split("_", 1)[1]
         text = _form_choice_text(lang, key)
         await show_loader_and_edit(query, text, reply_markup=kb_form_choice(lang, key), parse_mode="HTML", lang=lang); return
@@ -1014,7 +936,7 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         key = data.split("_", 1)[1]
         await _start_form_fill(query, context, lang, key); return
 
-    # FAQ-ответ
+    # FAQ
     if data.startswith("faq_"):
         if not is_admin(uid) and not await is_verified(uid):
             warn = "🔒 Спершу пройдіть верифікацію: натисніть «Верифікація»." if lang=="uk" else "🔒 Primero completa la verificación."
@@ -1024,8 +946,8 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         KB  = kb_for_lang(lang)
         info = KB.get(key) if key else None
         txt  = to_html(_clean_text(info["response"])) if info else "—"
-        # показываем контент + Назад в список быстрых тем
-        await show_loader_and_edit(query, txt, reply_markup=kb_back(lang, "menu_quick"), parse_mode="HTML", lang=lang); return
+        # Показать контент + «Назад» в быстрые темы
+        await show_loader_and_edit(query, txt, reply_markup=kb_back_to("menu_quick", lang), parse_mode="HTML", lang=lang); return
 
 # ---------- свободный текст / верификация / формы ----------
 async def free_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1036,53 +958,77 @@ async def free_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 1) Верификация шаги
     vf = context.user_data.get("verify")
     if vf:
-        txt = (update.message.text or "").strip()
-        step = vf.get("step", 1)
-        expect_phone = vf.get("expect_phone") or ""
-        email = vf.get("email") or ""
-        lang = vf.get("lang") or lang
+        try:
+            txt = (update.message.text or "").strip()
+            step = int(vf.get("step") or 1)
+            lang = vf.get("lang") or lang
 
-        if step == 1:
-            if _phones_match(txt, expect_phone):
-                try:
-                    await _issue_and_send_otp(update.effective_user.id, email, lang)
-                except Exception as e:
-                    err = "❌ Не вдалося надіслати код на пошту. Повідомте HR." if lang=="uk" else "❌ No se pudo enviar el código al correo. Avisa a RR. HH."
-                    await update.message.reply_text(err + f"\n{e}")
+            # шаг 1 — телефон
+            if step == 1:
+                if _phones_match(txt, vf.get("expect_phone") or ""):
+                    vf["step"] = 2
+                    log.info("[verify] phone matched -> ask email")
+                    prompt = "✉️ Тепер вкажіть робочу пошту, куди надішлемо код." if lang=="uk" else "✉️ Now enter your work email to receive a code."
+                    await update.message.reply_text(prompt)
+                else:
+                    log.info("[verify] phone mismatch")
+                    msg = "❌ Номер не співпадає. Спробуйте ще раз." if lang=="uk" else "❌ The number doesn’t match. Try again."
+                    await update.message.reply_text(msg)
+                return
+
+            # шаг 2 — ввод e-mail и отправка кода
+            if step == 2:
+                email = _norm_email(txt)
+                if not email or "@" not in email:
+                    await update.message.reply_text("✉️ Введіть коректну пошту." if lang=="uk" else "✉️ Please enter a valid email.")
                     return
-                vf["step"] = 3
-                em_mask = _mask_email(email)
-                hint = ("✉️ Надіслали код на " if lang=="uk" else "✉️ Enviamos un código a ") + f"<b>{html.escape(em_mask)}</b>\n" + \
-                       ("Введіть 6 цифр. Команда для повторної відправки: /resend" if lang=="uk" else "Introduce 6 dígitos. Comando para reenviar: /resend")
-                await update.message.reply_text(hint, parse_mode="HTML")
-            else:
-                msg = "❌ Номер не співпадає. Спробуйте ще раз." if lang=="uk" else "❌ El número no coincide. Intenta de nuevo."
-                await update.message.reply_text(msg)
-            return
 
-        if step == 3:
-            code = re.sub(r"\D+", "", txt)
-            if len(code) != 6:
-                warn = "Введіть саме 6 цифр коду." if lang=="uk" else "Introduce exactamente 6 dígitos."
-                await update.message.reply_text(warn)
+                vf["email"] = email
+                code = _gen_otp_code(6)
+                vf["otp"] = code
+                vf["otp_sent_ts"] = int(time.time())
+                vf["attempts"] = 0
+                vf["resends"] = 0
+                sent = await send_email(email, _otp_subject(lang), _otp_body(lang, code, OTP_TTL_MIN))
+                if sent:
+                    log.info(f"[verify] otp sent to {email}")
+                    msg = "✅ Код надіслано на пошту. Введіть його тут." if lang=="uk" else "✅ Code sent to your email. Enter it here."
+                    vf["step"] = 3
+                    await update.message.reply_text(msg)
+                else:
+                    log.error(f"[verify] otp send failed to {email}")
+                    msg = "❌ Не вдалося надіслати код. Спробуйте ще раз." if lang=="uk" else "❌ Failed to send the code. Try again."
+                    await update.message.reply_text(msg)
                 return
-            ok, reason = await _otp_verify(update.effective_user.id, code)
-            if ok:
-                await set_verified(update.effective_user.id, 1)
-                context.user_data["verify"] = None
-                done = "✅ Верифікацію пройдено. Доступ відкрито." if lang=="uk" else "✅ Verificación completada. Acceso concedido."
-                await update.message.reply_text(done, reply_markup=await kb_main_for(update.effective_user.id))
+
+            # шаг 3 — проверка кода
+            if step == 3:
+                vf["attempts"] += 1
+                if vf["attempts"] > OTP_ATTEMPTS_MAX:
+                    warn = "🚫 Забагато спроб. Почніть знову: /verify" if lang=="uk" else "🚫 Too many attempts. Start again: /verify"
+                    context.user_data["verify"] = None
+                    await update.message.reply_text(warn)
+                    return
+
+                code = (txt.replace(" ", "") or "")
+                good = (code and vf.get("otp") and code == vf["otp"])
+                fresh = (int(time.time()) - int(vf.get("otp_sent_ts") or 0) <= OTP_TTL_MIN*60)
+
+                if good and fresh:
+                    await set_verified(update.effective_user.id, 1)
+                    context.user_data["verify"] = None
+                    done = "✅ Верифікацію пройдено. Доступ відкрито." if lang=="uk" else "✅ Verification complete. Access granted."
+                    await update.message.reply_text(done, reply_markup=await kb_main_for(update.effective_user.id))
+                else:
+                    if not fresh:
+                        await update.message.reply_text("⌛ Код прострочено. Надішліть /resend щоб отримати новий." if lang=="uk" else "⌛ Code expired. Send /resend to get a new one.")
+                    else:
+                        await update.message.reply_text("❌ Невірний код. Спробуйте ще." if lang=="uk" else "❌ Incorrect code. Try again.")
                 return
-            if reason == "expired":
-                msg = "⌛ Термін дії коду минув. Відправте новий: /resend" if lang=="uk" else "⌛ El código ha expirado. Reenvía con /resend"
-            elif reason == "too_many":
-                msg = "⛔ Забагато спроб. Запросіть новий код: /resend" if lang=="uk" else "⛔ Demasiados intentos. Pide un nuevo código: /resend"
-            elif reason == "no_active":
-                msg = "ℹ️ Активного коду немає. Запросіть новий: /resend" if lang=="uk" else "ℹ️ No hay código activo. Usa /resend"
-            else:
-                msg = "❌ Невірний код. Спробуйте ще." if lang=="uk" else "❌ Código incorrecto. Intenta de nuevo."
-            await update.message.reply_text(msg)
-            return
+        except Exception as e:
+            log.exception(f"[verify] error: {e}")
+            await update.message.reply_text("⚠️ Сталася помилка під час верифікації. Спробуйте ще раз." if lang=="uk" else "⚠️ Verification error. Please try again.")
+        return
 
     # 2) Идёт заполнение формы?
     ff = context.user_data.get("form_fill")
@@ -1122,7 +1068,7 @@ async def free_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Не знайдено такий логін. Спробуйте ще раз або зверніться до HR." if lang=="uk" else "❌ No encontré este login. Intenta de nuevo o contacta RR. HH.")
             return
 
-    # 4) Гейт
+    # 4) Гейт: ответы только после верификации (кроме админов)
     if not is_admin(update.effective_user.id) and not await is_verified(update.effective_user.id):
         note = "🔒 Щоб отримати відповіді, пройдіть верифікацію (кнопка в меню)." if lang=="uk" else "🔒 Para ver respuestas, completa la verificación (botón en el menú)."
         await update.message.reply_text(note, reply_markup=await kb_main_for(update.effective_user.id))
@@ -1133,9 +1079,8 @@ async def free_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     hit = find_best_match(text, lang)
     await asyncio.sleep(0.1)
     if hit:
-        # показываем ответ + Назад в быстрые темы
         await update.message.reply_text(to_html(_clean_text(hit)), parse_mode="HTML",
-                                        reply_markup=kb_back(lang, "menu_quick"),
+                                        reply_markup=kb_back_to("main", lang),
                                         disable_web_page_preview=True)
     else:
         await update.message.reply_text(TX["start_banner"][lang], parse_mode="HTML",
@@ -1271,7 +1216,7 @@ async def cmd_import_profiles(update: Update, context: ContextTypes.DEFAULT_TYPE
             "phone":     (r.get("phone") or "").strip(),
             "manager":   _clean_text(r.get("manager") or ""),
             "vacation_left": int((r.get("vacation_left") or "0").strip() or 0),
-            "salary_usd":   int((r.get("salary_usd")   or "0").strip() or 0),
+            "salary_usd":   int((r.get("salary_usd") or "0").strip() or 0),
             "extra_json": None
         }
         count += 1
@@ -1285,7 +1230,7 @@ async def cmd_dump_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Лише для адмінів."); return
     login = " ".join(context.args).strip() or (await get_user_login(uid)) or ""
     if not login:
-        await update.message.reply_text("Вкажіть логін: /dump_profile maria"); return
+        await update.message.reply_text("Вкажіть логін: /dump_profile john"); return
     p = await get_profile_by_login(login)
     if not p:
         await update.message.reply_text(f"Профіль '{login}' не знайдено."); return
